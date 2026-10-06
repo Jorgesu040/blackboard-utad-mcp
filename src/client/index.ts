@@ -152,6 +152,8 @@ export class BlackboardClient {
   async keepAlive(): Promise<void> {
     await this.http.request({
       path: expand('sessionKeepAlive'),
+      method: 'POST',
+      forceAllowWrite: true,
       retries: 0,
       allowNotFound: true,
       allowRefresh: false,

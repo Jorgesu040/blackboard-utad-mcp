@@ -51,22 +51,22 @@ export interface RefreshResult {
  */
 export async function refreshSession(
   session: Session,
-  opts: { force?: boolean } = {},
+  _opts: { force?: boolean } = {},
 ): Promise<RefreshResult> {
   const baseHost = new URL(session.baseUrl).hostname;
   const hops: string[] = [];
   const hostsSeen = new Set<string>([baseHost]);
+  let visitedIdp = false;
 
   // Work on a copy so a failed refresh cannot corrupt a still-usable session.
   const jar = await cloneJar(session.jar);
 
-  // `force` walks the full provider chain even when the current session would
-  // still be accepted. A live session short-circuits at `GET /ultra -> 200`,
-  // which proves nothing about whether renewal *would* work. So verifying the
-  // capability means temporarily setting the session cookies aside.
-  if (opts.force) await dropSessionCookies(jar, session.baseUrl);
-
   const before = await sessionCookieFingerprint(jar, session.baseUrl);
+
+  // Always drop Blackboard's session cookies on the working copy before starting:
+  // Ultra serves a static 200 SPA shell at `/ultra` whenever *any* BbRouter cookie
+  // is present (even an expired one), preventing the SAML redirect from firing.
+  await dropSessionCookies(jar, session.baseUrl);
 
   let url = `${session.baseUrl}/ultra`;
   let method = 'GET';
@@ -75,6 +75,7 @@ export async function refreshSession(
   for (let hop = 0; hop < MAX_HOPS; hop += 1) {
     const target = new URL(url);
     hostsSeen.add(target.hostname);
+    if (target.hostname !== baseHost) visitedIdp = true;
 
     if (!isAllowedHost(target.hostname, baseHost, session.idpHosts)) {
       return fail(hops, hostsSeen, `refusing to send cookies to ${target.hostname}`);
@@ -126,15 +127,18 @@ export async function refreshSession(
 
     const html = await res.text();
 
-    // ── did the IdP demand a real sign-in? ──
-    if (needsInteractiveLogin(html, target.hostname, baseHost)) {
-      return {
-        ok: false,
-        hops,
-        hostsSeen: [...hostsSeen],
-        needsInteractiveLogin: true,
-        reason: `${target.hostname} is asking for credentials; the identity-provider session has expired`,
-      };
+    // ── Blackboard login landing page with SAML entry link (e.g. U-tad) ──
+    if (target.hostname === baseHost && !visitedIdp) {
+      const samlLoginMatch =
+        /["'](https?:\/\/[^"']*\/auth-saml\/saml\/login\?[^"']+|\/auth-saml\/saml\/login\?[^"']+)["']/i.exec(
+          html,
+        );
+      if (samlLoginMatch?.[1]) {
+        url = new URL(decodeHtmlAttr(samlLoginMatch[1]), url).toString();
+        method = 'GET';
+        body = undefined;
+        continue;
+      }
     }
 
     // ── an auto-submitting form is the SSO handoff; replay it ──
@@ -154,6 +158,20 @@ export async function refreshSession(
       method = 'GET';
       body = undefined;
       continue;
+    }
+
+    // ── did the IdP demand a real sign-in? ──
+    if (
+      needsInteractiveLogin(html, target.hostname, baseHost) ||
+      (target.searchParams.has('sso_reload') && looksLikeIdpBootstrap(html, target.hostname, baseHost))
+    ) {
+      return {
+        ok: false,
+        hops,
+        hostsSeen: [...hostsSeen],
+        needsInteractiveLogin: true,
+        reason: `${target.hostname} is asking for credentials; the identity-provider session has expired`,
+      };
     }
 
     // ── back on Blackboard with a new session? ──
@@ -221,7 +239,10 @@ function isAllowedHost(host: string, baseHost: string, pinned: string[] | undefi
 /** Federation endpoints institutions actually use. */
 const KNOWN_IDP_SUFFIXES = [
   'login.microsoftonline.com',
+  'microsoftonline.com',
   'login.microsoft.com',
+  'microsoftazuread-sso.com',
+  'login.live.com',
   'sts.windows.net',
   'login.windows.net',
   'accounts.google.com',
@@ -331,6 +352,13 @@ function needsInteractiveLogin(html: string, host: string, baseHost: string): bo
 /** A stable fingerprint of the session cookies, to prove renewal happened. */
 async function sessionCookieFingerprint(jar: CookieJar, url: string): Promise<string | null> {
   const cookies = await jar.getCookies(url);
+  const router = cookies.find((c) => c.key === 'BbRouter');
+  // Unauthenticated landing pages on Blackboard SaaS emit a visitor BbRouter
+  // (`expires:...,id:...,signature:...,site:...,v:2,xsrf:...`) with no `user:` field.
+  // Never mistake an unauthenticated visitor cookie for a renewed session.
+  if (router && router.value.includes('expires:') && !/(?:^|,)user:/.test(decodeURIComponent(router.value))) {
+    return null;
+  }
   const parts = cookies
     .filter((c) => SESSION_COOKIES.includes(c.key))
     .sort((a, b) => a.key.localeCompare(b.key))
@@ -382,10 +410,18 @@ async function pruneToHosts(jar: CookieJar, hosts: string[]): Promise<void> {
 async function dropSessionCookies(jar: CookieJar, baseUrl: string): Promise<void> {
   const host = new URL(baseUrl).hostname;
   const serialised = await jar.serialize();
+  const dropKeys = [
+    ...SESSION_COOKIES,
+    'samlCookie',
+    'samlSessionId',
+    'saml_logout_request',
+    'saml_logout_apId',
+    'saml_corr_recovery',
+  ];
   const kept = serialised.cookies.filter((c) => {
     const domain = String(c.domain ?? '').replace(/^\./, '');
     const isBlackboard = domain === host;
-    return !(isBlackboard && [...SESSION_COOKIES, 'samlCookie'].includes(String(c.key)));
+    return !(isBlackboard && dropKeys.includes(String(c.key)));
   });
   const rebuilt = await CookieJar.deserialize({ ...serialised, cookies: kept });
   (jar as unknown as { store: unknown }).store = (
@@ -444,10 +480,26 @@ export async function discoverIdpHosts(
     hops.push(`${target.hostname}${target.pathname} -> ${res.status}`);
     if (target.hostname !== baseHost) hosts.add(target.hostname);
 
-    if (res.status < 300 || res.status >= 400) break;
-    const loc = res.headers.get('location');
-    if (!loc) break;
-    url = new URL(loc, url).toString();
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      url = new URL(loc, url).toString();
+      continue;
+    }
+
+    if (res.ok && target.hostname === baseHost && hosts.size === 0) {
+      const html = await res.text().catch(() => '');
+      const samlLoginMatch =
+        /["'](https?:\/\/[^"']*\/auth-saml\/saml\/login\?[^"']+|\/auth-saml\/saml\/login\?[^"']+)["']/i.exec(
+          html,
+        );
+      if (samlLoginMatch?.[1]) {
+        url = new URL(decodeHtmlAttr(samlLoginMatch[1]), url).toString();
+        continue;
+      }
+    }
+
+    break;
   }
 
   log.debug('Discovered identity provider hosts', [...hosts]);

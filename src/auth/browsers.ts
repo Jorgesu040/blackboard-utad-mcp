@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
 import { existsSync, readFileSync, copyFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { homedir, platform, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { BlackboardError } from '../lib/errors.js';
 import { log } from '../lib/logger.js';
 
@@ -122,14 +122,19 @@ export function discoverProfiles(): BrowserProfile[] {
       continue;
     }
     for (const dir of dirs) {
-      const db = join(root, dir, 'cookies.sqlite');
+      const profileDir = join(root, dir);
+      const db = join(profileDir, 'cookies.sqlite');
       if (!existsSync(db)) continue;
       found.push({
         browser: 'Firefox',
         label: `Firefox: ${dir.replace(/^[a-z0-9]+\./i, '')}`,
         cookieDb: db,
         family: 'firefox',
-        mtime: safeMtime(db),
+        mtime: Math.max(
+          safeMtime(db),
+          safeMtime(join(profileDir, 'sessionstore.jsonlz4')),
+          safeMtime(join(profileDir, 'sessionstore-backups', 'recovery.jsonlz4')),
+        ),
       });
     }
   }
@@ -144,6 +149,104 @@ function safeMtime(p: string): number {
   } catch {
     return 0;
   }
+}
+
+/**
+ * Decompresses Mozilla's custom LZ4 frame (`mozLz40\0` + uint32LE size + raw LZ4 block).
+ * Firefox stores session cookies (including Blackboard's `BbRouter` and `JSESSIONID`)
+ * in `sessionstore.jsonlz4` / `sessionstore-backups/recovery.jsonlz4`, never in `cookies.sqlite`.
+ */
+function decompressMozLz4(buf: Buffer): string {
+  if (buf.length < 12 || buf.subarray(0, 8).toString('utf8') !== 'mozLz40\0') {
+    throw new Error('Not a valid mozLz40 file');
+  }
+  const outSize = buf.readUInt32LE(8);
+  const out = Buffer.alloc(outSize);
+  let ip = 12;
+  let op = 0;
+  while (ip < buf.length) {
+    const token = buf[ip++]!;
+    let litLen = token >> 4;
+    if (litLen === 15) {
+      let b: number;
+      do {
+        b = buf[ip++]!;
+        litLen += b;
+      } while (b === 255 && ip < buf.length);
+    }
+    buf.copy(out, op, ip, ip + litLen);
+    ip += litLen;
+    op += litLen;
+    if (ip >= buf.length) break;
+    const offset = buf.readUInt16LE(ip);
+    ip += 2;
+    let matchLen = (token & 0x0f) + 4;
+    if ((token & 0x0f) === 15) {
+      let b: number;
+      do {
+        b = buf[ip++]!;
+        matchLen += b;
+      } while (b === 255 && ip < buf.length);
+    }
+    let mp = op - offset;
+    for (let i = 0; i < matchLen; i += 1) {
+      out[op++] = out[mp++]!;
+    }
+  }
+  return out.subarray(0, op).toString('utf8');
+}
+
+function readFirefoxSessionStoreCookies(cookieDbPath: string): Array<Record<string, unknown>> {
+  const profileDir = dirname(cookieDbPath);
+  const candidates = [
+    join(profileDir, 'sessionstore-backups', 'recovery.jsonlz4'),
+    join(profileDir, 'sessionstore-backups', 'recovery.baklz4'),
+    join(profileDir, 'sessionstore.jsonlz4'),
+    join(profileDir, 'sessionstore-backups', 'previous.jsonlz4'),
+  ]
+    .filter((p) => existsSync(p))
+    .sort((a, b) => safeMtime(b) - safeMtime(a));
+
+  const seen = new Set<string>();
+  const out: Array<Record<string, unknown>> = [];
+
+  for (const file of candidates) {
+    try {
+      const raw = decompressMozLz4(readFileSync(file));
+      const data = JSON.parse(raw) as {
+        cookies?: Array<{
+          host?: string;
+          name?: string;
+          value?: string;
+          path?: string;
+          secure?: boolean;
+          httponly?: boolean;
+        }>;
+      };
+      const cookies = Array.isArray(data?.cookies) ? data.cookies : [];
+      if (cookies.length === 0) continue;
+      for (const c of cookies) {
+        if (!c?.host || !c?.name || !c?.value) continue;
+        const key = `${c.host}\0${c.path ?? '/'}\0${c.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          host: String(c.host),
+          name: String(c.name),
+          value: String(c.value),
+          path: String(c.path ?? '/'),
+          isSecure: c.secure ? 1 : 0,
+          isHttpOnly: c.httponly ? 1 : 0,
+          expiry: 0,
+        });
+      }
+      if (out.length > 0) break;
+    } catch (err) {
+      log.debug(`Could not read Firefox sessionstore ${file}`, String(err));
+    }
+  }
+
+  return out;
 }
 
 /**
@@ -189,7 +292,16 @@ async function queryCookieDb(
         const stmt = db.prepare(
           `SELECT host, name, value, path, isSecure, isHttpOnly, expiry FROM moz_cookies WHERE ${clause}`,
         );
-        return stmt.all(...params) as Array<Record<string, unknown>>;
+        const dbRows = stmt.all(...params) as Array<Record<string, unknown>>;
+        const ssRows = readFirefoxSessionStoreCookies(profile.cookieDb).filter((c) => {
+          if (byName) return byName.includes(String(c.name ?? ''));
+          const hLower = String(c.host ?? '').replace(/^\./, '').toLowerCase();
+          return hosts.some((w) => {
+            const wLower = w.toLowerCase();
+            return hLower === wLower || hLower.endsWith(`.${wLower}`);
+          });
+        });
+        return [...dbRows, ...ssRows];
       }
       // expires_utc is microseconds since 1601 and overflows a JS safe integer,
       // which node:sqlite refuses to coerce. Read it as text and parse.
@@ -411,15 +523,20 @@ export async function readBrowserCookies(
   if (rows.length === 0) return [];
 
   if (profile.family === 'firefox') {
-    return rows.map((r) => ({
-      host: String(r.host ?? ''),
-      name: String(r.name ?? ''),
-      value: String(r.value ?? ''),
-      path: String(r.path ?? '/'),
-      secure: Boolean(r.isSecure),
-      httpOnly: Boolean(r.isHttpOnly),
-      expires: Number(r.expiry ?? 0) * 1000,
-    }));
+    return rows
+      .filter((r) => !['saml_logout_request', 'saml_logout_apId'].includes(String(r.name ?? '')))
+      .map((r) => {
+        const rawExp = Number(r.expiry ?? 0);
+        return {
+          host: String(r.host ?? ''),
+          name: String(r.name ?? ''),
+          value: String(r.value ?? ''),
+          path: String(r.path ?? '/'),
+          secure: Boolean(r.isSecure),
+          httpOnly: Boolean(r.isHttpOnly),
+          expires: rawExp > 1e11 ? rawExp : rawExp * 1000,
+        };
+      });
   }
 
   const keys = await chromiumKey(profile);
@@ -495,7 +612,10 @@ export async function discoverInstances(
       for (const r of rows) {
         const host = String(r.host_key ?? r.host ?? '').replace(/^\./, '');
         if (!host) continue;
-        const isBbRouter = String(r.name) === 'BbRouter';
+        const rawVal = String(r.value ?? '');
+        const isBbRouter =
+          String(r.name) === 'BbRouter' &&
+          (!rawVal.includes('expires:') || /(?:^|,)user:/.test(decodeURIComponent(rawVal)));
         // JSESSIONID alone is any Java app; require a Blackboard-looking host.
         if (!isBbRouter && !/blackboard|learn|bb\./i.test(host)) continue;
         // Blackboard's own file, CDN and developer hosts also set BbRouter but
@@ -509,17 +629,24 @@ export async function discoverInstances(
     }
   }
 
-  // Strongest evidence first: a real BbRouter beats a bare JSESSIONID, and a
-  // recently-used profile beats a stale one.
+  // Strongest evidence first: a real BbRouter beats a bare JSESSIONID, Firefox
+  // beats Chromium on Windows (where Chrome 127+ uses App-Bound Encryption),
+  // and a recently-used profile beats a stale one.
   return out.sort(
-    (a, b) => Number(b.hasBbRouter) - Number(a.hasBbRouter) || b.profile.mtime - a.profile.mtime,
+    (a, b) =>
+      Number(b.hasBbRouter) - Number(a.hasBbRouter) ||
+      (isWin ? Number(b.profile.family === 'firefox') - Number(a.profile.family === 'firefox') : 0) ||
+      b.profile.mtime - a.profile.mtime,
   );
 }
 
 /** Hosts worth pulling alongside Blackboard, so silent refresh can work. */
 export const IDP_COOKIE_HOSTS = [
   'login.microsoftonline.com',
+  'microsoftonline.com',
   'login.microsoft.com',
+  'microsoftazuread-sso.com',
+  'login.live.com',
   'login.windows.net',
   'sts.windows.net',
   'accounts.google.com',

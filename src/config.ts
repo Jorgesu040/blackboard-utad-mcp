@@ -4,8 +4,8 @@ import { configPath, stateDir, ensureDir, downloadDir } from './lib/paths.js';
 import { BlackboardError } from './lib/errors.js';
 
 export const ConfigSchema = z.object({
-  /** Origin of the Blackboard instance, e.g. "https://blackboard.example.edu". */
-  baseUrl: z.string().url(),
+  /** Origin of the Blackboard instance, defaults to U-tad's Blackboard. */
+  baseUrl: z.string().url().default('https://u-tad.blackboard.com'),
   /** Human label shown in tool output; defaults to the hostname. */
   label: z.string().optional(),
   /** Cap on rows returned by list tools before pagination kicks in. */
