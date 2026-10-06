@@ -51,7 +51,7 @@ export class Session {
     /** Mutated wholesale by a successful silent refresh. */
     public jar: CookieJar,
     public xsrfToken: string | undefined,
-    readonly userAgent: string,
+    public userAgent: string,
     public capturedAt: Date,
     public user: StoredSession['user'],
     /** IdP hosts this session is permitted to re-authenticate through. */
@@ -221,6 +221,22 @@ export class Session {
   }
 
   async persist(): Promise<void> {
+    try {
+      const onDisk = await Session.tryLoad();
+      if (onDisk && onDisk.capturedAt.getTime() > this.capturedAt.getTime()) {
+        // Another process (e.g. `auth login`) saved a newer session while this
+        // server was running: adopt it rather than clobbering it with stale state.
+        this.jar = onDisk.jar;
+        this.xsrfToken = onDisk.xsrfToken;
+        this.userAgent = onDisk.userAgent;
+        this.capturedAt = onDisk.capturedAt;
+        this.user = onDisk.user;
+        this.idpHosts = onDisk.idpHosts;
+        return;
+      }
+    } catch {
+      /* ignore read errors before writing */
+    }
     const payload: StoredSession = {
       version: 1,
       baseUrl: this.baseUrl,

@@ -46,7 +46,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "build": "tsc -p tsconfig.build.json && node -e \"fs.chmodSync('dist/cli.js', 0o755)\"",
+    "prepare": "npm run build",
     "dev": "tsc -p tsconfig.build.json --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "npm run build && node --test --experimental-strip-types test/*.test.ts",
@@ -67,11 +68,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/felipedias-ie/blackboard-mcp.git"
+    "url": "git+https://github.com/Jorgesu040/blackboard-utad-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/felipedias-ie/blackboard-mcp/issues"
+    "url": "https://github.com/Jorgesu040/blackboard-utad-mcp/issues"
   },
-  "homepage": "https://github.com/felipedias-ie/blackboard-mcp#readme",
+  "homepage": "https://github.com/Jorgesu040/blackboard-utad-mcp#readme",
   "author": "felipedias-ie"
 }

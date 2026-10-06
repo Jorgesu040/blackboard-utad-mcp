@@ -95,6 +95,21 @@ export class HttpClient {
     }
 
     this.refreshing = (async () => {
+      try {
+        const onDisk = await Session.tryLoad();
+        if (onDisk && onDisk.capturedAt.getTime() > this.session.capturedAt.getTime()) {
+          this.session.jar = onDisk.jar;
+          this.session.xsrfToken = onDisk.xsrfToken;
+          this.session.userAgent = onDisk.userAgent;
+          this.session.capturedAt = onDisk.capturedAt;
+          this.session.user = onDisk.user;
+          this.session.idpHosts = onDisk.idpHosts;
+          this.refreshAttempts = 0;
+          return true;
+        }
+      } catch {
+        /* continue to SAML refresh */
+      }
       this.refreshAttempts += 1;
       this.lastRefresh = Date.now();
       const result = await refreshSession(this.session);
@@ -323,12 +338,15 @@ export class HttpClient {
 
   /** Keeps the jar current so rotating session cookies survive across calls. */
   private async absorbCookies(res: Response, url: string): Promise<void> {
+    if (res.status >= 400) return;
     const setCookies = res.headers.getSetCookie?.() ?? [];
     if (setCookies.length === 0) return;
     for (const raw of setCookies) {
       await this.session.jar.setCookie(raw, url, { ignoreError: true });
     }
-    await this.session.persist();
+    if (this.session.user) {
+      await this.session.persist();
+    }
   }
 
   async json<T>(opts: RequestOptions): Promise<T> {

@@ -187,7 +187,7 @@ export async function loginFromBrowser(
     const discovered = await discoverIdpHosts(baseUrl)
       .then((r) => r.hosts)
       .catch(() => [] as string[]);
-    const idpHosts = discovered.length > 0 ? discovered : IDP_COOKIE_HOSTS;
+    const idpHosts = [...new Set([...discovered, ...IDP_COOKIE_HOSTS])];
     if (discovered.length > 0) {
       log.info(`Identity provider for ${candidate.host}: ${discovered.join(', ')}`);
     } else {
@@ -232,28 +232,18 @@ export async function loginFromBrowser(
       continue;
     }
 
+    if (discovered.length > 0 && !refreshed) {
+      session.idpHosts = [...new Set([...discovered, ...session.idpHosts])];
+    }
     session.user = { id: user.id, userName: user.userName, displayName: displayName(user) };
     await session.persist();
 
-    // Prove renewal works now, rather than promising it and failing in three
-    // hours. This also narrows the pinned provider list and discards the
-    // speculative cookies that had to be imported before the provider was known.
-    let canAutoRefresh = false;
-    try {
-      const verify = await refreshSession(session, { force: true });
-      canAutoRefresh = verify.ok;
-      if (!verify.ok) {
-        log.warn(`Renewal check failed: ${verify.reason ?? 'unknown'}`);
-        // The forced walk set the session cookies aside; the working session is
-        // untouched on failure, so re-probe to be certain it still functions.
-        if (!(await probe(session, config))) {
-          failures.push(`${candidate.host}: session broke during the renewal check`);
-          continue;
-        }
-      }
-    } catch (err) {
-      log.debug('Renewal check errored', (err as Error).message);
-    }
+    // When `probe()` already succeeded (`!refreshed`), do NOT force a second SAML
+    // login (`refreshSession(..., { force: true })`) while the browser tab is open:
+    // on Blackboard Ultra + SAML SLO, minting a competing SAML session invalidates
+    // the browser tab's SAML session and redirects the open tab to SAML Single Logout
+    // (`LogoutRequest`), which terminates the identity-provider session on Microsoft.
+    const canAutoRefresh = refreshed || session.idpHosts.length > 0;
     log.info(`Signed in as ${displayName(user)} on ${baseUrl} (from ${candidate.profile.label})`);
 
     return {
@@ -279,6 +269,7 @@ async function probe(session: Session, config: Config): Promise<BbUser | null> {
       path: expand('self'),
       query: { expand: 'systemRoles,insRoles' },
       retries: 0,
+      allowRefresh: false,
     });
   } catch (err) {
     log.debug('Session probe failed', (err as Error).message);
