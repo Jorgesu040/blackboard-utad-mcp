@@ -184,21 +184,16 @@ export class BlackboardClient {
       if (stopped) return;
       try {
         const remaining = await this.sessionSecondsRemaining();
-        if (remaining <= 0) {
-          log.info('Session expired; attempting silent renewal');
-          const ok = await this.http.tryRefresh();
-          log.info(ok ? 'Session renewed' : 'Silent renewal unavailable. User must sign in again');
-          return;
-        }
-        if (remaining < threshold) {
+        if (remaining > 0 && remaining < threshold) {
           log.debug(`Session has ${Math.round(remaining / 60)} min left; pinging keep-alive`);
           await this.keepAlive();
         }
       } catch (err) {
-        // A failed probe is usually the session already being gone; let the
-        // renewal path handle it rather than treating it as fatal.
-        log.debug('Session keeper tick failed', (err as Error).message);
-        await this.http.tryRefresh().catch(() => false);
+        // Do NOT call tryRefresh() from a background timer: on single-session
+        // Blackboard instances (like U-tad), a background SAML login invalidates
+        // the user's active browser session. Let HttpClient.request() refresh
+        // lazily only when an MCP tool is actually called.
+        log.debug('Session keeper tick skipped (session inactive)', (err as Error).message);
       }
     };
 

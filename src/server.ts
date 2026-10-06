@@ -77,20 +77,25 @@ export async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Keep the Blackboard session alive in the background so a long-running
-  // client session never hits an expiry mid-conversation. Failure here is not
-  // fatal: the user may simply not have signed in yet.
+  // Only run background session keep-alive when explicitly requested via
+  // BLACKBOARD_MCP_KEEPALIVE=1. Otherwise, background SAML renewals triggered
+  // on IDE startup or 10-minute timers will invalidate the user's active session
+  // in another browser (e.g. Brave) on single-session Blackboard instances.
+  // On-demand silent SAML renewal in HttpClient.request() still renews expired
+  // sessions automatically whenever an MCP tool is actually invoked.
   let stopKeeper: (() => void) | undefined;
-  void (async () => {
-    try {
-      const { BlackboardClient } = await import('./client/index.js');
-      const client = await BlackboardClient.create();
-      stopKeeper = client.startSessionKeeper();
-      log.debug('Session keeper started');
-    } catch (err) {
-      log.debug('Session keeper not started', (err as Error).message);
-    }
-  })();
+  if (process.env.BLACKBOARD_MCP_KEEPALIVE === '1') {
+    void (async () => {
+      try {
+        const { BlackboardClient } = await import('./client/index.js');
+        const client = await BlackboardClient.create();
+        stopKeeper = client.startSessionKeeper();
+        log.debug('Session keeper started');
+      } catch (err) {
+        log.debug('Session keeper not started', (err as Error).message);
+      }
+    })();
+  }
 
   // Keep the shutdown quiet and prompt: clients kill the process on close.
   const shutdown = () => {
