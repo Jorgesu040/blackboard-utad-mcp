@@ -16,6 +16,22 @@ Then ask your assistant things like:
 
 ---
 
+## Nota para U-tad (`u-tad.blackboard.com`)
+
+Este fork está adaptado específicamente para **Blackboard Ultra de U-tad** (`https://u-tad.blackboard.com`) en Windows:
+
+1. **Importación automática desde Firefox (`sessionstore` LZ4)**:
+   - En Windows, los navegadores basados en Chromium 127+ (Brave, Chrome, Edge) cifran las cookies con *App-Bound Encryption (`v20`)* y bloquean `Network/Cookies` mientras están abiertos.
+   - Este fork incluye un descompresor `mozLz40` para leer las cookies de sesión en RAM de **Firefox** (`sessionstore-backups/recovery.jsonlz4` y `sessionstore.jsonlz4`) junto con las cookies persistentes de Microsoft Entra ID (`cookies.sqlite`), permitiendo `auth login` y renovación silenciosa SAML sin pegar cURL manualmente.
+2. **Flujo SAML y `keepAlive` de U-tad**:
+   - Sigue automáticamente el enlace `/auth-saml/saml/login?apId=_131_1` de la portada de U-tad, descarta cookies `BbRouter` anónimas de visitante y usa `POST /learn/api/v1/utilities/keepBbSessionActive` para mantener viva la sesión.
+3. **Convivencia con tu navegador (Brave vs. Firefox) y política de sesión única**:
+   - Blackboard de U-tad aplica una **política de sesión SAML única por usuario**: cuando un cliente realiza un login SAML nuevo (`POST /auth-saml/saml/SSO`), Blackboard invalida cualquier otra cookie `BbRouter` distinta que tu usuario tuviera abierta en otro navegador.
+   - Para evitar que el servidor MCP te cierre la sesión mientras usas Blackboard en **Brave**, **el refresco SAML periódico en segundo plano (`startSessionKeeper`) está desactivado por defecto**. El servidor MCP permanece 100 % pasivo en segundo plano y **solo** renueva su sesión SAML bajo demanda en el instante exacto en que le pidas activamente a la IA consultar algo de Blackboard.
+   - **Consejo**: Si quieres usar Blackboard en el navegador y hacer consultas al MCP *exactamente al mismo tiempo* sin que una sesión reemplace a la otra, usa **Firefox** (ya que el MCP importa y comparte la misma cookie `BbRouter` activa de Firefox sin generar un login SAML competitivo). Si usas **Brave** a diario, puedes navegar sin interrupciones; únicamente ten en cuenta que en el momento puntual en que pidas una consulta al MCP, este renovará su propia sesión si había caducado.
+
+---
+
 ## Why this exists
 
 Blackboard's documented REST API requires an OAuth application registered and approved by your institution's Blackboard administrator. Most students and many staff can't get one.
